@@ -1,0 +1,15 @@
+{"root": "Root", "nodes":
+{
+  "Root":
+{"node_type": "RootTask",
+  "params": {"name": "Root", "state_dim": 4, "action_dim": 3},
+  "subtasks": ["Balance", "Position", "Move","Test"]
+},
+  "Balance": {"node_type": "BalancedTask",
+    "params": {"name": "Balance", "state_dim": 4, "action_dim": 2}, "subtasks": []},
+  "Position": {"node_type": "PositionTask",
+    "params": {"name": "Position", "state_dim": 4, "action_dim": 2}, "subtasks": []},
+  "Move": {"node_type": "MoveTask", "params": {"name": "Move", "state_dim": 4, "action_dim": 2}, "subtasks": []},
+  "Test": {"node_type": "TestTask", "params": {"name": "Test", "state_dim": 4, "action_dim": 2}, "subtasks": []}
+},
+  "module_paths": ["test_import.py"]}
