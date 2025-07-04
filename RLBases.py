@@ -156,6 +156,8 @@ class RLInnerModelBase(metaclass=SerializeAndTBMeta):
     columns需要是其子集才能被其使用
     '''
     columns=["state", "action", "reward", "next_state", "done","length"]
+    columns_type_dict = {"state": np.float32, "action": np.float32, "reward": np.float32,
+                         "next_state": np.float32, "done": np.float32,"length":np.int32}
     #支持的State的类型如spaces.Discrete(n)、spaces.Box(low, high, shape)
     support_state_types=[]
     #支持的action的类型如spaces.Discrete(n)、spaces.Box(low, high, shape)
@@ -253,14 +255,15 @@ class RLInnerModelBase(metaclass=SerializeAndTBMeta):
         else:
             action = self.exploration_strategy.select_action(*args,step=self.steps_done+1,is_eval=is_eval,episode=self.episode)
         return action
+    '''
     def convert_data(self,key,value):
-        '''
-
+        
         :param key: data中的键如“state”、“action”...
         :param value: data[key]
         :return: 转换为合适的模式如将int/ndarray转换为Torch.tensor
-        '''
+        
         return value
+    '''
     def process_state(self,state):
         return self.state_processor(state)
 
@@ -351,11 +354,29 @@ class OffPolicyInnerModel(RLInnerModelBase):
     def update(self):
         if self.steps_done%self.update_freq==0 and self.steps_done>=self.steps_before_update:
             if self.memory.can_sample(self.batch_size) :
+
                 indices,batch_data,weights=self.memory.sample(self.batch_size)
+                data={column:torch.from_numpy(batch_data[column]).to(self.device) for column in self.__class__.columns}
+                D = len(self.state_space.shape)
+
+                state=data["state"][0]
+
+                if state.ndim == D + 1:
+                    # 向量环境
+                    '''
+                    b, n, *s = state.shape
+                    state = state.reshape(b * n, *s)
+                    '''
+                elif state.ndim == D:
+                    # 普通环境
+                    pass
+                else:
+                    raise ValueError(f"Unexpected states shape: {state.shape}")
                 self.update_cnt=self.update_cnt+1
-                self._update(indices,batch_data,weights)
+                self._update(indices,data,weights)
                 for callback in self.callbacks:
                     callback.onUpdateFinished(self.update_cnt,self)
+
     def _update(self,indices,batch_data,weights):
         raise NotImplementedError
 
@@ -452,6 +473,7 @@ class RLAgent(IterationModel,metaclass=TBMeta):
                 self.env = CSVLoggerWrapper(env, filename=monitor_csv, info_keywords=info_keywords)
             else:
                 self.env = RecordEpisodeStatistics(env)
+
         self.seed=seed
         self.epsilon = 1.0
         self.render_mode = render_mode
@@ -614,6 +636,7 @@ class RLAgent(IterationModel,metaclass=TBMeta):
     def save_experience(self, state, action,reward, next_state, done):
         data = {"state": self.inner_model.process_state(state), "action": action, "reward": reward, "next_state": self.inner_model.process_state(next_state),
                 "done": done,"length":1}
+
         if isinstance(self.inner_model, OffPolicyInnerModel):
             self.inner_model.append_memory(data,self.current_iteration+1)
     def draw_history(self,save_path=None):

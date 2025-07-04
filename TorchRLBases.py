@@ -58,6 +58,7 @@ class TorchRLInnerModelDecorator:
                     self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 else:
                     self.device =device
+            '''
             def convert_data(self,key,value):
                 if key=="state":
                     return torch.tensor(value, device=self.device,dtype=torch.float32)
@@ -75,7 +76,7 @@ class TorchRLInnerModelDecorator:
                     #return torch.tensor(value, dtype=torch.int64,device=self.device)
                 else:
                     return value
-
+            '''
             def append_memory(self,data,episode):
                 self.memory.append(data,episode,self)
         return NewClass

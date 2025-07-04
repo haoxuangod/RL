@@ -17,20 +17,24 @@ class ValueOffPolicyInnerModel(OffPolicyInnerModel):
                          steps_before_update=steps_before_update,tensorboard_log_dir=tensorboard_log_dir,exploration_strategy=exploration_strategy)
         self.lr=lr
 
-    def get_current_value(self, data, to_basic_type):
+    def get_current_value(self, states,actions, to_basic_type):
         '''
         返回data中state的预估评分
-        :param data: 可以是一个dict或者是[dict1,dict2,dict3...]即批量获取或者单个获取
+        :param states:代表当前状态的torchTensor [batch_size,state_shape...]
+        :param actions:代表在当前状态下所进行的行动的torchTensor [batch_size,action_shape...]
         :param to_basic_type:是否将结果转换为float/int等初始类型，因为torch在训练时需要
         模型的梯度信息必须返回tensor，而调用memory的append方法的current_value应该为基础类型
-        :return:
+        :return:Q(s,a)评估值
         '''
         raise NotImplementedError
 
-    def get_target_value(self, data, to_basic_type: bool):
+    def get_target_value(self, next_states,rewards,dones,lengths, to_basic_type: bool):
         '''
         返回data中目标的评分(如TD误差)
-        :param data: 可以是一个dict数据或者是[dict1,dict2,dict3...]即批量数据或者单个数据
+        :param next_states:下一个状态的FloatTensor [batch_size,state_shape...]
+        :param rewards:当前所获得的收益FloatTensor [batch_size,1]
+        :param dones:当前环境是否结束IntTensor [batch_size,1]
+        :param lengths:当前采样运行的长度IntTensor [batch_size,1]
         :param to_basic_type:是否将结果转换为float/int等初始类型，因为torch在训练时需要
         模型的梯度信息必须返回tensor，而调用memory的append方法的target_value应该为基础类型
         :return:
@@ -40,6 +44,7 @@ class ValueOffPolicyInnerModel(OffPolicyInnerModel):
     def _update(self, indices, batch_data, weights):
         # 反向传播
         self.optimizer.zero_grad()
+
         critic_loss,current_q,expected_q=self.get_critic_loss(batch_data,weights,return_only_loss=False)
         self.memory.update(indices, current_q.detach().cpu().numpy(), expected_q.detach().cpu().numpy())
         critic_loss.backward()
@@ -59,12 +64,12 @@ class ValueOffPolicyInnerModel(OffPolicyInnerModel):
         if hasattr(self,"scheduler"):
             self.scheduler.step()
 
-
-
     def get_critic_loss(self,data,weights,return_only_loss=True):
-        current_q = self.get_current_value(data, to_basic_type=False)
+
+        current_q = self.get_current_value(data["state"],data["action"], to_basic_type=False)
         with torch.no_grad():
-            expected_q = self.get_target_value(data, to_basic_type=False)
+            expected_q = self.get_target_value(data["next_state"],data["reward"],data["done"],data["length"],to_basic_type=False)
+
         '''
         print("current_q",current_q.requires_grad, current_q.grad_fn)
         print("target:", expected_q.requires_grad, expected_q.grad_fn)

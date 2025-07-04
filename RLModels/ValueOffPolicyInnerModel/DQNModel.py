@@ -28,6 +28,7 @@ class DQNInnerModel(TorchRLInnerModelDecorator(MultiStepInnerModelDecorator(Valu
     '''
     '''
     columns = ["state", "action", "reward", "next_state", "done", "length"]
+
     '''
     有问题待修改
     '''
@@ -119,10 +120,20 @@ class DQNInnerModel(TorchRLInnerModelDecorator(MultiStepInnerModelDecorator(Valu
         return CombineNet(input_net, output_net,tensorboard_log_dir=self.tensorboard_log_dir).to(self.device)
 
     def set_default_memory(self):
+        '''
         self.memory = PrioritizedReplayBuffer(capacity=self.memory_capacity, n_steps=self.n_steps, alpha=0.6, beta=0.4,
                                               columns=self.__class__.columns)
-
-        self.memory=ExperienceReplayBuffer(capacity=self.memory_capacity,n_steps=self.n_steps,gamma=self.gamma,columns=self.__class__.columns)
+        '''
+        info_dict=self.columns_type_dict.copy()
+        dic={"state":self.state_space.shape,
+             "action":self.action_space.shape,
+             "next_state":self.state_space.shape,
+             "reward":(1,),
+             "done":(1,),
+             "length":(1,)}
+        info_dict={key:(val,dic[key]) for key,val in info_dict.items()}
+        self.memory=ExperienceReplayBuffer(capacity=self.memory_capacity,n_steps=self.n_steps,gamma=self.gamma,
+                                           columns=self.__class__.columns,columns_info_dict=info_dict)
 
     def get_max_action_value(self,states, to_basic_type):
         max_value = self.target_net(states).max(-1)[0]
@@ -430,24 +441,7 @@ class NAFInnerModel(DQNInnerModel):
             return V.detach().cpu().numpy()
         return V
 
-    def get_current_value(self, data, to_basic_type):
-        # [batch_size,action_dim]
-        if isinstance(data, dict):
-            data1 = {column: [data[column]] for column in self.__class__.columns}
-        else:
-            data1 = {column: [d[column] for d in data] for column in self.__class__.columns}
-
-        states = torch.stack(data1["state"])
-        rewards = torch.stack(data1["reward"])
-        next_states = torch.stack(data1["next_state"])
-        dones = torch.stack(data1["done"])
-        if isinstance(data1["length"][0], int):
-            lengths = torch.tensor(data1["length"], dtype=torch.long, device=self.device)
-        else:
-            lengths = torch.stack(data1["length"])
-        actions = torch.stack(data1["action"])
-        flag = False
-
+    def get_current_value(self, states,actions, to_basic_type):
         mu, V,Q,P = self.policy_net(states,actions)
         current_q=Q.unsqueeze(-1)
 
@@ -455,26 +449,11 @@ class NAFInnerModel(DQNInnerModel):
             return current_q.detach().cpu().numpy()
         return current_q
 
-    def get_target_value(self, data, to_basic_type):
-        # [batch_size,action_dim]
-        if isinstance(data, dict):
-            data1 = {column: [data[column]] for column in self.__class__.columns}
-        else:
-            data1 = {column: [d[column] for d in data] for column in self.__class__.columns}
-        states = torch.stack(data1["state"])
-        rewards = torch.stack(data1["reward"])
-        next_states = torch.stack(data1["next_state"])
-        dones = torch.stack(data1["done"])
-        # n_steps维护时可能会修改
-        if isinstance(data1["length"][0], int):
-            lengths = torch.tensor(data1["length"], dtype=torch.long, device=self.device)
-        else:
-            lengths = torch.stack(data1["length"])
-        rewards=rewards.unsqueeze(-1)
-        actions = torch.stack(data1["action"])
+    def get_target_value(self, next_states,rewards,dones,lengths, to_basic_type):
+
         mu,V,_,_ = self.target_net(next_states)
         next_q=V.detach().unsqueeze(-1)
-        tmp = ((1 - dones) * self.gamma ** lengths).unsqueeze(1)
+        tmp = ((1 - dones) * self.gamma ** lengths)
         expected_q = rewards + tmp * next_q
 
         if to_basic_type:
@@ -492,8 +471,10 @@ class PopArtNAFInnerModel(NAFInnerModel):
                                       a_min=self.action_space.low, a_max=self.action_space.high)
         return output_net
     def get_critic_loss(self, data, weights, update_stats=True,return_only_loss=True):
-        current_q = self.get_current_value(data, to_basic_type=False)
-        expected_q = self.get_target_value(data, to_basic_type=False)
+        current_q = self.get_current_value(data["state"], data["action"], to_basic_type=False)
+        with torch.no_grad():
+            expected_q = self.get_target_value(data["next_state"], data["reward"], data["done"], data["length"],
+                                               to_basic_type=False)
         weights = torch.asarray(weights, device=self.device)
         weights = weights.unsqueeze(1)
         popart = self.policy_net.output_net.popart
@@ -508,11 +489,9 @@ class PopArtNAFInnerModel(NAFInnerModel):
         self.summary_writer.add_scalar("popart/sigma", sigma.mean(), self.update_cnt)
         u_norm = (current_q - mu) / sigma
         y_norm = (expected_q - mu) / sigma
-
         clamp_val = 10.0  # 或 20.0，看你希望最大容许 10 个标准差以内
         u_norm = u_norm.clamp(min=-clamp_val, max=clamp_val)
         y_norm = y_norm.clamp(min=-clamp_val, max=clamp_val)
-
         td_loss = (weights * nn.SmoothL1Loss(reduction='none')(u_norm, y_norm)).mean()
         return td_loss if return_only_loss else (td_loss, current_q, expected_q)
 class ConservativeDoubleNAFInnerModel(NAFInnerModel):
@@ -666,22 +645,8 @@ class ConservativeDoubleNAFInnerModel(NAFInnerModel):
                                             self.update_cnt)
         self.optimizer.step()
         self.scheduler.step()
-    def get_current_value(self, data, to_basic_type,net=0):
-        # [batch_size,action_dim]
-        if isinstance(data, dict):
-            data1 = {column: [data[column]] for column in self.__class__.columns}
-        else:
-            data1 = {column: [d[column] for d in data] for column in self.__class__.columns}
+    def get_current_value(self, states,actions,to_basic_type,net=0):
 
-        states = torch.stack(data1["state"])
-        rewards = torch.stack(data1["reward"])
-        next_states = torch.stack(data1["next_state"])
-        dones = torch.stack(data1["done"])
-        if isinstance(data1["length"][0], int):
-            lengths = torch.tensor(data1["length"], dtype=torch.long, device=self.device)
-        else:
-            lengths = torch.stack(data1["length"])
-        actions = torch.stack(data1["action"])
         flag = False
         if len(actions.shape) == 1:
             # action是一个数字的情况
@@ -780,27 +745,15 @@ class ConservativeDoubleNAFInnerModel(NAFInnerModel):
         td_loss = (td_loss1+td_loss2)/2
         return td_loss if return_only_loss else (td_loss, current_q, expected_q)
 class DoubleNAFInnerModel(NAFInnerModel):
-    def get_target_value(self, data, to_basic_type):
+    '''
+    该改进逻辑有问题,结果很差需要修改
+    '''
+    def get_target_value(self, next_states,rewards,dones,lengths, to_basic_type):
         # [batch_size,action_dim]
-        if isinstance(data, dict):
-            data1 = {column: [data[column]] for column in self.__class__.columns}
-        else:
-            data1 = {column: [d[column] for d in data] for column in self.__class__.columns}
-        states = torch.stack(data1["state"])
-        rewards = torch.stack(data1["reward"])
-        next_states = torch.stack(data1["next_state"])
-        dones = torch.stack(data1["done"])
-        # n_steps维护时可能会修改
-        if isinstance(data1["length"][0], int):
-            lengths = torch.tensor(data1["length"], dtype=torch.long, device=self.device)
-        else:
-            lengths = torch.stack(data1["length"])
-
-        actions = torch.stack(data1["action"])
         mu1,V1,_,_=self.policy_net(next_states)
         mu, V, Q,_ = self.target_net(next_states,mu1)
-        next_q=Q.detach()
-        tmp = ((1 - dones) * self.gamma ** lengths).unsqueeze(1)
+        next_q=Q.detach().unsqueeze(-1)
+        tmp = ((1 - dones) * self.gamma ** lengths)
         expected_q = rewards + tmp * next_q
         if to_basic_type:
             return expected_q.detach().cpu().numpy()

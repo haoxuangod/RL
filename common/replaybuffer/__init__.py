@@ -8,17 +8,21 @@ from RL.common.utils.decorator.Meta import SerializeMeta
 
 
 class InnerBuffer:
-    def __init__(self, capacity=10000):
+    def __init__(self, columns_info_dict,capacity=10000):
         self.capacity = capacity
-        self.memory = deque(maxlen=capacity)
+        self.columns_info_dict=columns_info_dict
+        self.memory={column:np.zeros(shape=(capacity,)+shape,dtype=tp) for column,(tp,shape) in self.columns_info_dict.items()}
+        self.columns=[column for column, (tp, shape) in self.columns_info_dict.items()]
         self.tot_add = 0
+        self.size=0
         self.last_episode = -1
         # 记录每个episode的初始位置和结束位置
         self.episode_dict = {}
         self._new_episode_flag = True
+        self.current_idx = 0
 
     def __len__(self):
-        return self.memory.__len__()
+        return self.size
 
     def __getitem__(self, item):
         return self.memory[item]
@@ -37,28 +41,28 @@ class InnerBuffer:
             tmp = self.episode_dict[episode]
             self.episode_dict[episode] = (tmp[0], self.tot_add)
         self._append(data, episode, inner_model)
-
+        self.size=min(self.capacity,self.size+1)
+        self.current_idx=(self.current_idx+1)%self.capacity
     def _append(self, data, episode, inner_model=None):
-        self.memory.append(data)
-
+        for column, value in data.items():
+            self.memory[column][self.current_idx]=value
     def sample(self, batch_size):
-        indices = random.sample(range(len(self.memory)), batch_size)
-        batch = [self.memory[i] for i in indices]
+        indices = random.sample(range(self.size), batch_size)
+        batch = {column:np.stack([self.memory[column][i] for i in indices]) for column in self.columns}
         weights = [1 for i in range(batch_size)]
         return indices, batch, weights
-
 
 class MultiStepInnerBuffer(InnerBuffer):
     '''
     维护multi-step
     '''
 
-    def __init__(self, capacity=10000, n_steps=1, gamma=0.99):
+    def __init__(self, columns_info_dict,capacity=10000, n_steps=1, gamma=0.99):
         self.n_steps = n_steps
         self.capacity = capacity
         if n_steps > self.capacity:
             raise ValueError('n_steps must be equal or less than capacity')
-        super().__init__(capacity)
+        super().__init__(columns_info_dict=columns_info_dict,capacity=capacity)
         self.gamma = gamma
         self.multistep_memory = deque(maxlen=capacity)
         self.tot_add = 0
@@ -71,7 +75,8 @@ class MultiStepInnerBuffer(InnerBuffer):
 
     def _append(self, data, episode, inner_model=None):
         if self.n_steps == 1:
-            self.memory.append(data)
+            for column, value in data.items():
+                self.memory[column][self.current_idx]=value
             return
         # 维护相邻的（state1,next_state1） (state2,next_state2) next_state1=state2 这样的大小为n_steps的窗口
         if len(self.memory) == 0:
@@ -135,11 +140,12 @@ class MultiStepInnerBuffer(InnerBuffer):
 
     def sample(self, batch_size):
         if self.n_steps == 1:
-            indices = random.sample(range(len(self.memory)), batch_size)
-            batch = [self.memory[i] for i in indices]
+            indices = random.sample(range(self.size), batch_size)
+            batch = {column:np.stack([self.memory[column][i] for i in indices]) for column in self.columns}
             weights = np.ones(batch_size)
 
         else:
+            #还没有修改
             indices = random.sample(range(len(self.multistep_memory)), batch_size)
             batch = [self.multistep_memory[i] for i in indices]
             weights = np.ones(batch_size)
@@ -147,19 +153,25 @@ class MultiStepInnerBuffer(InnerBuffer):
 
 
 class ReplayBuffer(metaclass=SerializeMeta):
-    def __init__(self,capacity,columns=[]):
+    def __init__(self,capacity,columns=[],columns_info_dict={}):
         '''
-
         :param capacity: 缓存区容量
         :param columns:每一条数据有的数据名称，用于约束data
+        :param columns_info_dict:每一个数据名称对应的(类型,shape)其中shape不包含capacity
         '''
         self.capacity = capacity
         self.columns = columns
-        self.buffer= InnerBuffer(capacity)
+        self.columns_info_dict = columns_info_dict
+        for column in self.columns:
+            if column not in columns_info_dict:
+                raise KeyError(f"Missing required column: {column}")
+
+        self.buffer= InnerBuffer(capacity=capacity,columns_info_dict=columns_info_dict)
 
     def append(self, data:dict,episode,inner_model=None):
         if sorted(data.keys()) == sorted(self.columns):
-            data={key:inner_model.convert_data(key,data[key])for key in data.keys()}
+            #data={key:inner_model.convert_data(key,data[key])for key in data.keys()}
+
             self._append(data,episode,inner_model)
         else:
             raise Exception("The data can not match the columns.")
@@ -185,13 +197,13 @@ class ReplayBuffer(metaclass=SerializeMeta):
         raise NotImplementedError
 class ExperienceReplayBuffer(ReplayBuffer):
 
-    def __init__(self, columns, capacity=10000,gamma=0.99,n_steps=1):
-        super().__init__(capacity,columns)
+    def __init__(self, columns,columns_info_dict,capacity=10000,gamma=0.99,n_steps=1):
+        super().__init__(capacity=capacity,columns=columns,columns_info_dict=columns_info_dict)
         self.n_steps = n_steps
         self.gamma = gamma
         if n_steps<=0:
             raise ValueError("n_steps must be a positive integer")
-        self.buffer = MultiStepInnerBuffer(capacity=capacity,gamma=gamma,n_steps=n_steps)
+        self.buffer = MultiStepInnerBuffer(columns_info_dict=self.columns_info_dict,capacity=capacity,gamma=gamma,n_steps=n_steps)
 
     def _append(self, data,eposide,inner_model=None):
         self.buffer.append(data,eposide,inner_model)
@@ -202,11 +214,12 @@ class ExperienceReplayBuffer(ReplayBuffer):
         if l<self.n_steps:
             return False
         if self.n_steps==1:
-            '''
-            直接使用属性不规范
-            '''
-            return batch_size<=len(self.buffer.memory)
+
+            return batch_size<=len(self.buffer)
         else:
+            '''
+            multistep还没有修改完成
+            '''
             return batch_size<=len(self.buffer.multistep_memory)
 
     def _sample(self, batch_size):
