@@ -1,3 +1,4 @@
+import copy
 import random
 from collections import deque
 
@@ -7,22 +8,80 @@ import numpy as np
 from RL.common.utils.decorator.Meta import SerializeMeta
 
 
+class InnerBufferMemory:
+    '''
+    维护每一字段的数据字典 {column:实际的np数组}
+    '''
+    def __init__(self,columns_info_dict,capacity):
+        self.capacity = capacity
+        self.columns_info_dict = columns_info_dict
+        self.memory={column: np.zeros(shape=(capacity,) + shape, dtype=tp) for column, (tp, shape) in
+        self.columns_info_dict.items()}
+        self.columns = [column for column, (tp, shape) in self.columns_info_dict.items()]
+        self.current_idx=0
+        self.size=0
+    def __len__(self):
+        return self.size
+    def __getitem__(self, key):
+        if isinstance(key,int):
+            if key>=0:
+                return {column:self.memory[column][key] for column in self.columns}
+            else:
+                return {column: self.memory[column][(self.current_idx+key+self.capacity)%self.capacity] for column in self.columns}
+        elif isinstance(key,str):
+            return self.memory[key]
+        elif isinstance(key,tuple):
+            if len(key)>2:
+                raise KeyError("tuple key must be less equal than 2 elements")
+            if len(key)==2:
+                '''
+                合法的是[column,:],[column,index],[index,column],[index,:]
+                '''
+                if isinstance(key[0],str) and isinstance(key[1],slice):
+                    return self.memory[key[0]][key[1]]
+                elif isinstance(key[0],str) and isinstance(key[1],int):
+                    idx=key[1]
+                    if idx<0:
+                        idx=(self.current_idx+idx+self.capacity)%self.capacity
+                    return self.memory[key[0]][idx]
+                elif isinstance(key[0],int) and isinstance(key[1],str):
+                    idx=key[0]
+                    if idx<0:
+                        idx=(self.current_idx+idx+self.capacity)%self.capacity
+                    return self.memory[key[1]][idx]
+                elif isinstance(key[0],slice) and isinstance(key[1],str):
+                    return self.memory[key[1]][key[0]]
+                else:
+                    raise KeyError("2-tuple must be [column,:],[column,index],[index,column],[index,:]")
+
+            elif len(key)==1:
+                return self[key[0]]
+            else:
+                return self.memory
+        elif isinstance(key,slice):
+            pass
+        else:
+            raise KeyError("key must be int,str")
+    def append(self, data):
+        self.size = min(self.capacity, self.size + 1)
+        for column, value in data.items():
+            self.memory[column][self.current_idx] = value
+        self.current_idx = (self.current_idx + 1) % self.capacity
+
 class InnerBuffer:
     def __init__(self, columns_info_dict,capacity=10000):
         self.capacity = capacity
         self.columns_info_dict=columns_info_dict
-        self.memory={column:np.zeros(shape=(capacity,)+shape,dtype=tp) for column,(tp,shape) in self.columns_info_dict.items()}
-        self.columns=[column for column, (tp, shape) in self.columns_info_dict.items()]
+        self.memory=InnerBufferMemory(columns_info_dict=columns_info_dict,capacity=capacity)
+        self.columns = [column for column, (tp, shape) in self.columns_info_dict.items()]
         self.tot_add = 0
-        self.size=0
         self.last_episode = -1
         # 记录每个episode的初始位置和结束位置
         self.episode_dict = {}
         self._new_episode_flag = True
-        self.current_idx = 0
 
     def __len__(self):
-        return self.size
+        return len(self.memory)
 
     def __getitem__(self, item):
         return self.memory[item]
@@ -41,13 +100,13 @@ class InnerBuffer:
             tmp = self.episode_dict[episode]
             self.episode_dict[episode] = (tmp[0], self.tot_add)
         self._append(data, episode, inner_model)
-        self.size=min(self.capacity,self.size+1)
-        self.current_idx=(self.current_idx+1)%self.capacity
+
+
     def _append(self, data, episode, inner_model=None):
-        for column, value in data.items():
-            self.memory[column][self.current_idx]=value
+        self.memory.append(data)
+
     def sample(self, batch_size):
-        indices = random.sample(range(self.size), batch_size)
+        indices = random.sample(range(len(self.memory)), batch_size)
         batch = {column:np.stack([self.memory[column][i] for i in indices]) for column in self.columns}
         weights = [1 for i in range(batch_size)]
         return indices, batch, weights
@@ -64,7 +123,7 @@ class MultiStepInnerBuffer(InnerBuffer):
             raise ValueError('n_steps must be equal or less than capacity')
         super().__init__(columns_info_dict=columns_info_dict,capacity=capacity)
         self.gamma = gamma
-        self.multistep_memory = deque(maxlen=capacity)
+        self.multistep_memory =InnerBufferMemory(self.columns_info_dict,capacity)
         self.tot_add = 0
         self.last_episode = -1
         # 记录每个episode的初始位置和结束位置
@@ -72,11 +131,9 @@ class MultiStepInnerBuffer(InnerBuffer):
         self._new_episode_flag = True
         self.cur_window_size = 0
         self.cur_window_value = 0
-
     def _append(self, data, episode, inner_model=None):
         if self.n_steps == 1:
-            for column, value in data.items():
-                self.memory[column][self.current_idx]=value
+            self.memory.append(data)
             return
         # 维护相邻的（state1,next_state1） (state2,next_state2) next_state1=state2 这样的大小为n_steps的窗口
         if len(self.memory) == 0:
@@ -84,7 +141,7 @@ class MultiStepInnerBuffer(InnerBuffer):
             self.cur_window_value = data["reward"]
         else:
             if self.cur_window_size < self.n_steps:
-                next_state = self.memory[-1]["next_state"]
+                next_state = self.memory["next_state",-1]
                 # if set(next_state)==set(data["state"]):
                 if (next_state == data["state"]).all():
                     self.cur_window_size = self.cur_window_size + 1
@@ -94,19 +151,21 @@ class MultiStepInnerBuffer(InnerBuffer):
                     self.cur_window_size = 1
                     self.cur_window_value = data["reward"]
             else:
-                next_state = self.memory[-1]["next_state"]
+                next_state = self.memory["next_state",-1]
                 if set(next_state) == set(data["state"]):
-                    self.cur_window_value = (self.cur_window_value - self.memory[-self.cur_window_size][
-                        "reward"]) / self.gamma + data["reward"] * self.gamma ** (self.cur_window_size - 1)
+                    self.cur_window_value = ((self.cur_window_value - self.memory["reward",-self.cur_window_size])/
+                                             self.gamma + data["reward"] * self.gamma ** (self.cur_window_size - 1))
                 else:
                     self.cur_window_size = 1
                     self.cur_window_value = data["reward"]
         if self.cur_window_size == self.n_steps:
-            dic_tmp = self.memory[-self.n_steps + 1].copy()
+            dic_tmp = {column: self.memory[column,-self.n_steps + 1] for column,value in data.items()}
             dic_tmp["reward"] = self.cur_window_value
             dic_tmp["next_state"] = data["next_state"]
             dic_tmp["done"] = data["done"]
+            dic_tmp["length"]= self.n_steps
             self.multistep_memory.append(dic_tmp)
+
         self.memory.append(data)
         self._new_episode_flag = False
 
@@ -140,14 +199,13 @@ class MultiStepInnerBuffer(InnerBuffer):
 
     def sample(self, batch_size):
         if self.n_steps == 1:
-            indices = random.sample(range(self.size), batch_size)
+            indices = random.sample(range(len(self.memory)), batch_size)
             batch = {column:np.stack([self.memory[column][i] for i in indices]) for column in self.columns}
             weights = np.ones(batch_size)
 
         else:
-            #还没有修改
             indices = random.sample(range(len(self.multistep_memory)), batch_size)
-            batch = [self.multistep_memory[i] for i in indices]
+            batch = {column:np.stack([self.multistep_memory[column][i] for i in indices]) for column in self.columns}
             weights = np.ones(batch_size)
         return indices, batch, weights
 
